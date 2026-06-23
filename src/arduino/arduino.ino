@@ -206,45 +206,49 @@ String currentTimeStr() {
   return String(buf);
 }
 
-// ─── Status bar (16px tall) ───────────────────────────────────────────────────
-// Built-in 5x7 font: baseline at cursor_y, cap top = cursor_y - 6.
-// Bar height = 16px. Center text vertically: cursor_y = (16 + 6) / 2 = 11.
-// Battery icon (w=12, h=7) centered: icon_y = (16 - 7) / 2 = 4.
+// ─── Status bar ───────────────────────────────────────────────────────────────
+// Built-in 5x7 font: glyph is 7px tall (rows 0-6 relative to top).
+// GFX draws with baseline at cursor_y: top of glyph = cursor_y - 6.
+// STATUS_H=16. To vertically center: cursor_y = (16 - 7) / 2 + 6 = 10.
+// Battery icon h=7, center: iconY = (16 - 7) / 2 = 4.
 #define STATUS_H 16
 void drawStatusBar(int battPct) {
   display.setFont(nullptr);
   display.setTextColor(GxEPD_BLACK);
   display.setTextSize(1);
 
-  const int textY  = 11;  // baseline — centers 7px-tall glyphs in STATUS_H
-  const int iconY  =  4;  // top of battery icon
-  const int iconH  =  7;
-  const int iconW  = 12;
-  const int nubW   =  2;
-  const int nubH   =  4;
+  const int textY = 10;   // baseline for 5x7 font, centers glyph in 16px bar
+  const int iconY =  4;   // top of 7px-tall battery icon, centered in 16px bar
+  const int iconH =  7;
+  const int iconW = 11;
+  const int nubW  =  2;
+  const int nubH  =  3;
 
   // Time on left
   String ts = currentTimeStr();
   display.setCursor(2, textY);
   display.print(ts);
 
-  // Battery % text on right
+  // Battery % text — right edge at SCREEN_W-2
   char buf[8];
   snprintf(buf, sizeof(buf), "%d%%", battPct);
   int16_t x1, y1; uint16_t tw, th;
   display.getTextBounds(buf, 0, 0, &x1, &y1, &tw, &th);
-  int textX = SCREEN_W - (int)tw - 2;
-  display.setCursor(textX, textY);
+  int pctX = SCREEN_W - (int)tw - 2;
+  display.setCursor(pctX, textY);
   display.print(buf);
 
-  // Battery icon just left of % text, vertically centered
-  int bx = textX - iconW - nubW - 3;
+  // Battery body just left of % text
+  int bx = pctX - iconW - nubW - 2;
   int by = iconY;
   display.drawRect(bx, by, iconW, iconH, GxEPD_BLACK);
+  // Nub on right, centered vertically on icon
   display.drawRect(bx + iconW, by + (iconH - nubH) / 2, nubW, nubH, GxEPD_BLACK);
+  // Fill proportional to charge (inner area is iconW-2 wide, iconH-2 tall)
   int fill = constrain((int)(battPct / 100.0f * (iconW - 2)), 0, iconW - 2);
   if (fill > 0) display.fillRect(bx + 1, by + 1, fill, iconH - 2, GxEPD_BLACK);
 
+  // Separator line flush below bar
   display.drawFastHLine(0, STATUS_H, SCREEN_W, GxEPD_BLACK);
 }
 
@@ -321,28 +325,35 @@ void renderMatch(JsonObject match, int battPct) {
 
     drawStatusBar(battPct);
 
-    // Layout below status bar (STATUS_H=16):
-    // FreeSans9pt7b: ascender ~13px above baseline, descender ~3px below.
-    // FreeMonoBold18pt7b: ascender ~24px above baseline.
-    // Lines are drawn 4px below each section's baseline.
+    // Exact font metrics (from GFXglyph yOffset/height fields):
+    //   FreeSans9pt7b caps:      yOffset=-12, h=13  → top=y-12, bottom=y+1
+    //   FreeMonoBold18pt7b digits: yOffset=-22, h=23 → top=y-22, bottom=y+1
+    //
+    // Layout (y = baseline):
+    //   STATUS_H=16, separator at y=16
+    //   Teams:   top must clear y=18 → baseline = 18+12 = 30, sep at 30+4 = 34
+    //   Score:   top must clear y=36 → baseline = 36+22 = 58... use 82 for visual weight
+    //            sep at 82+4 = 86
+    //   Scorers: top at 88 → baseline = 88+12 = 100, sep at 104
+    //   Remaining 96px (104-200): status at 148, footer at 178
 
-    // Team names — baseline at y=36, line at y=42
-    leftText(trunc(homeName, 10).c_str(),  6,            36, &FreeSans9pt7b);
-    rightText(trunc(awayName, 10).c_str(), SCREEN_W - 6, 36, &FreeSans9pt7b);
-    display.drawFastHLine(6, 42, SCREEN_W - 12, GxEPD_BLACK);
+    // Team names
+    leftText(trunc(homeName, 10).c_str(),  6,            30, &FreeSans9pt7b);
+    rightText(trunc(awayName, 10).c_str(), SCREEN_W - 6, 30, &FreeSans9pt7b);
+    display.drawFastHLine(0, 34, SCREEN_W, GxEPD_BLACK);
 
-    // Score — baseline at y=95, line at y=103
-    centreText(scoreStr.c_str(), 95, &FreeMonoBold18pt7b);
-    display.drawFastHLine(6, 103, SCREEN_W - 12, GxEPD_BLACK);
+    // Score
+    centreText(scoreStr.c_str(), 82, &FreeMonoBold18pt7b);
+    display.drawFastHLine(0, 86, SCREEN_W, GxEPD_BLACK);
 
-    // Scorers — baseline at y=124, line at y=130
-    if (hScorer.length()) leftText(trunc(hScorer, 16).c_str(),  6,            124, &FreeSans9pt7b);
-    if (aScorer.length()) rightText(trunc(aScorer, 16).c_str(), SCREEN_W - 6, 124, &FreeSans9pt7b);
-    display.drawFastHLine(6, 130, SCREEN_W - 12, GxEPD_BLACK);
+    // Scorers
+    if (hScorer.length()) leftText(trunc(hScorer, 16).c_str(),  6,            100, &FreeSans9pt7b);
+    if (aScorer.length()) rightText(trunc(aScorer, 16).c_str(), SCREEN_W - 6, 100, &FreeSans9pt7b);
+    display.drawFastHLine(0, 104, SCREEN_W, GxEPD_BLACK);
 
-    // Status + footer — evenly spaced in remaining 70px (130–200)
-    centreText(statusLabel.c_str(), 158, &FreeSans9pt7b);
-    centreText(footer.c_str(),      183, &FreeSans9pt7b);
+    // Status + footer
+    centreText(statusLabel.c_str(), 148, &FreeSans9pt7b);
+    centreText(footer.c_str(),      178, &FreeSans9pt7b);
 
   } while (display.nextPage());
 }
