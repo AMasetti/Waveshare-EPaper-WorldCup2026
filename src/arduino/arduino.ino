@@ -32,7 +32,7 @@ GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> display(
 #define SCREEN_W        200
 #define SCREEN_H        200
 #define API_GAMES_URL   "https://worldcup26.ir/get/games"
-#define REFRESH_SECONDS 600
+#define REFRESH_SECONDS 60
 
 // ─── HTTP / JSON ──────────────────────────────────────────────────────────────
 // Stream directly from WiFiClient — no large heap allocation needed.
@@ -135,8 +135,8 @@ String scorerSummary(const String& raw) {
   return result;
 }
 
-// ─── Splash / WiFi icon ───────────────────────────────────────────────────────
-void drawLogoAndIcon(bool showIcon) {
+// ─── Splash ───────────────────────────────────────────────────────────────────
+void drawSplash() {
   int stride = (LOGO_W + 7) / 8;
   display.setFullWindow();
   display.firstPage();
@@ -148,16 +148,20 @@ void drawLogoAndIcon(bool showIcon) {
         if (!((b >> (7 - (x % 8))) & 1)) display.drawPixel(x, y, GxEPD_BLACK);
       }
     }
-    if (showIcon) {
-      int cx = SCREEN_W - 13, cy = 20;
-      display.fillRect(SCREEN_W - 30, 2, 29, 23, GxEPD_WHITE);
-      display.drawCircle(cx, cy, 15, GxEPD_BLACK);
-      display.drawCircle(cx, cy, 14, GxEPD_BLACK);
-      display.drawCircle(cx, cy,  9, GxEPD_BLACK);
-      display.drawCircle(cx, cy,  4, GxEPD_BLACK);
-      display.fillCircle(cx, cy,  2, GxEPD_BLACK);
-    }
   } while (display.nextPage());
+}
+
+void drawShutdown() {
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    centreText("Shutting down...", SCREEN_H / 2, &FreeSans9pt7b);
+  } while (display.nextPage());
+  delay(1000);
+  display.setFullWindow();
+  display.firstPage();
+  do { display.fillScreen(GxEPD_WHITE); } while (display.nextPage());
 }
 
 // ─── Match render ─────────────────────────────────────────────────────────────
@@ -231,6 +235,7 @@ void pwrButtonTask(void*) {
           }
           ledOff();
           Serial.println("Power off");
+          drawShutdown();
           digitalWrite(PWR_LATCH, LOW);  // release latch — battery IC cuts power
           delay(500);
           esp_deep_sleep_start();        // fallback if latch didn't cut power
@@ -278,7 +283,7 @@ void setup() {
   // Start power button watcher
   xTaskCreate(pwrButtonTask, "pwr", 2048, nullptr, 1, nullptr);
 
-  drawLogoAndIcon(false);
+  drawSplash();
   Serial.println("Splash shown");
   delay(2000);  // LED on + splash visible for 2s before proceeding
 
@@ -286,16 +291,14 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.printf("Connecting to %s", WIFI_SSID);
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    delay(100); Serial.print(".");
+  Serial.printf("Connecting to %s\n", WIFI_SSID);
+  {
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(100);
   }
-  Serial.println();
 
   if (WiFi.status() != WL_CONNECTED) { showError("WiFi failed"); goto sleep; }
   Serial.println("WiFi: " + WiFi.localIP().toString());
-  drawLogoAndIcon(true);
 
   {
     Serial.printf("Heap: %u  PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
