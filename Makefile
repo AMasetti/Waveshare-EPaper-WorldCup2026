@@ -14,7 +14,7 @@ PORT_GLOB_MAC   = /dev/cu.usbmodem*
 PORT_GLOB_LINUX = /dev/ttyACM* /dev/ttyUSB*
 FIND_PORT = $$(ls $(PORT_GLOB_MAC) 2>/dev/null | head -1 || ls $(PORT_GLOB_LINUX) 2>/dev/null | head -1)
 
-.PHONY: help compile upload flash monitor build-clean cp-deploy cp-monitor setup flash-version
+.PHONY: help compile upload flash monitor build-clean cp-deploy cp-monitor setup flash-version i2c-scan
 
 help:
 	@echo ""
@@ -33,6 +33,7 @@ help:
 	@echo "  make build-clean  Remove build artifacts"
 	@echo "  make cp-deploy    Copy src/circuitpython/code.py to CIRCUITPY"
 	@echo "  make cp-monitor   Open CircuitPython serial REPL"
+	@echo "  make i2c-scan     Flash I2C scanner to detect touch controller"
 	@echo ""
 
 setup:
@@ -107,3 +108,16 @@ cp-monitor:
 	@PORT=$(FIND_PORT); \
 	[ -z "$$PORT" ] && echo "ERROR: No serial port found" && exit 1; \
 	screen $$PORT $(BAUD)
+
+i2c-scan:
+	@echo "Compiling and flashing I2C scanner..."
+	$(ARDUINO_CLI) compile \
+		--fqbn $(FQBN) \
+		--config-file $(CLI_CONFIG) \
+		--build-path $(BUILD_DIR)/i2c_scan \
+		$(SKETCH_DIR)/i2c_scan
+	@PORT=$(FIND_PORT); \
+	[ -z "$$PORT" ] && echo "ERROR: No board detected" && exit 1; \
+	$(ARDUINO_CLI) upload --fqbn $(FQBN) --port $$PORT --input-dir $(BUILD_DIR)/i2c_scan
+	@echo "Opening serial monitor — Ctrl-A then Ctrl-\\ to exit"
+	@PORT=$(FIND_PORT); screen $$PORT $(BAUD)
