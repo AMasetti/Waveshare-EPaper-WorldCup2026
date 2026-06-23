@@ -56,8 +56,8 @@ flash-version:
 	@TMP=$$(mktemp -d) && \
 	curl -fsSL "https://github.com/$(GITHUB_REPO)/archive/refs/tags/$(VERSION).tar.gz" | tar -xz -C "$$TMP" && \
 	SRCDIR=$$(ls "$$TMP") && \
-	printf '#define WIFI_SSID     "%s"\n#define WIFI_PASSWORD "%s"\n' "$(SSID)" "$(PASSWORD)" \
-	  > "$$TMP/$$SRCDIR/src/arduino/secrets.h" && \
+	echo "#define WIFI_SSID     \"$(SSID)\""  > "$$TMP/$$SRCDIR/src/arduino/secrets.h" && \
+	echo "#define WIFI_PASSWORD \"$(PASSWORD)\"" >> "$$TMP/$$SRCDIR/src/arduino/secrets.h" && \
 	echo "Compiling $(VERSION) with your WiFi credentials..." && \
 	$(ARDUINO_CLI) compile \
 	  --fqbn $(FQBN) \
