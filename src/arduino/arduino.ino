@@ -1,8 +1,8 @@
-// Project: WorldCup2026  Version: v0.1.0
+// Project: WorldCup2026  Version: v0.2.0
 // Board: Waveshare ESP32-S3-ePaper-1.54 (200x200 B/W)
 // Shows most recent FIFA World Cup 2026 match: team names, score, scorers, status.
 // API: https://worldcup26.ir  (no key required)
-// Libraries: GxEPD2, ArduinoJson
+// Libraries: GxEPD2, ArduinoJson, qrcode
 
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -10,9 +10,17 @@
 #include <GxEPD2_BW.h>
 #include <Fonts/FreeMonoBold18pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <esp_adc_cal.h>
+#include <driver/adc.h>
+#include "qrcode.h"
+#include <time.h>
 #include "secrets.h"
 #include "fifa_logo.h"
 
+// ─── Pin definitions ──────────────────────────────────────────────────────────
 #define EPD_PWR      6
 #define EPD_BUSY     8
 #define EPD_RST      9
@@ -21,22 +29,65 @@
 #define EPD_SCK     12
 #define EPD_MOSI    13
 
-#define LED_PIN      3   // onboard LED
-#define PWR_BTN_PIN 18   // power button, active LOW with internal pull-up
-#define PWR_LATCH   17   // hold HIGH to keep board powered after button release
+#define LED_PIN      3
+#define PWR_BTN_PIN 18
+#define PWR_LATCH   17
+#define BUZZER_PIN   5   // wire a piezo buzzer between GPIO5 and GND
+#define BATT_ADC_CH  ADC1_CHANNEL_3   // GPIO4 — battery voltage divider
 
-GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> display(
-  GxEPD2_154_D67(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
-);
-
+// ─── Constants ────────────────────────────────────────────────────────────────
 #define SCREEN_W        200
 #define SCREEN_H        200
 #define API_GAMES_URL   "https://worldcup26.ir/get/games"
 #define REFRESH_SECONDS 60
+#define AP_SSID         "WorldCup2026-Setup"
+#define AP_IP           "192.168.4.1"
+#define PORTAL_URL      "http://" AP_IP
+
+// ─── RTC memory — survives deep sleep / restart, cleared on power-cycle ───────
+RTC_DATA_ATTR bool  firstBoot     = true;
+RTC_DATA_ATTR int   lastHomeScore = -1;
+RTC_DATA_ATTR int   lastAwayScore = -1;
+RTC_DATA_ATTR int   lastMatchId   = -1;
+RTC_DATA_ATTR bool  ntpSynced     = false;
+
+// ─── Display ──────────────────────────────────────────────────────────────────
+GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> display(
+  GxEPD2_154_D67(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
+);
+
+// ─── Battery ──────────────────────────────────────────────────────────────────
+// Voltage divider ratio on this board is 2:1 (100k + 100k).
+// LiPo: 4.2V full, 3.0V empty.
+int batteryPercent() {
+  esp_adc_cal_characteristics_t chars;
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12, 1100, &chars);
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(BATT_ADC_CH, ADC_ATTEN_DB_12);
+
+  uint32_t raw = 0;
+  for (int i = 0; i < 8; i++) raw += adc1_get_raw(BATT_ADC_CH);
+  raw /= 8;
+
+  uint32_t mv = esp_adc_cal_raw_to_voltage(raw, &chars);
+  float vbat = mv * 2.0f / 1000.0f;  // ×2 for the divider
+  int pct = (int)((vbat - 3.0f) / (4.2f - 3.0f) * 100.0f);
+  return constrain(pct, 0, 100);
+}
+
+// ─── Buzzer ───────────────────────────────────────────────────────────────────
+void beep(int freq, int ms) {
+  tone(BUZZER_PIN, freq, ms);
+  delay(ms + 20);
+}
+
+void scoreBeep() {
+  beep(880, 150);
+  beep(1100, 150);
+  beep(1320, 300);
+}
 
 // ─── HTTP / JSON ──────────────────────────────────────────────────────────────
-// Stream directly from WiFiClient — no large heap allocation needed.
-// stream->setTimeout ensures the socket stays open for the full 49KB body.
 bool httpGetJson(const char* url, JsonDocument& doc) {
   Serial.printf("[HTTP] GET %s\n", url);
   HTTPClient http;
@@ -47,9 +98,7 @@ bool httpGetJson(const char* url, JsonDocument& doc) {
   Serial.printf("[HTTP] code=%d size=%d heap=%u\n", code, size, ESP.getFreeHeap());
   if (code != 200) { http.end(); return false; }
 
-  // Read full body into heap buffer, then parse — streaming fails with low heap
   char* buf = (char*)malloc(size + 1);
-  Serial.printf("[HTTP] buf=%p\n", buf);
   if (!buf) { http.end(); return false; }
 
   WiFiClient* stream = http.getStreamPtr();
@@ -106,7 +155,6 @@ String scorerName(const String& entry) {
   return (space > 0) ? entry.substring(0, space) : entry;
 }
 
-// {"Lionel Messi 38'","Lionel Messi 90+5'"} → "Messi x2"
 String scorerSummary(const String& raw) {
   if (raw == "null" || raw.length() < 3) return "";
   String names[10];
@@ -133,6 +181,59 @@ String scorerSummary(const String& raw) {
     i += n;
   }
   return result;
+}
+
+// ─── NTP ──────────────────────────────────────────────────────────────────────
+void syncNTP() {
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  struct tm t;
+  unsigned long t0 = millis();
+  while (!getLocalTime(&t) && millis() - t0 < 5000) delay(100);
+  if (getLocalTime(&t)) {
+    ntpSynced = true;
+    Serial.printf("NTP: %02d:%02d UTC\n", t.tm_hour, t.tm_min);
+  } else {
+    Serial.println("NTP sync failed");
+  }
+}
+
+String currentTimeStr() {
+  if (!ntpSynced) return "--:--";
+  struct tm t;
+  if (!getLocalTime(&t)) return "--:--";
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+  return String(buf);
+}
+
+// ─── Status bar (top 14px) ────────────────────────────────────────────────────
+// Left: HH:MM (UTC)   Right: battery icon + %
+void drawStatusBar(int battPct) {
+  display.setFont(nullptr);
+  display.setTextColor(GxEPD_BLACK);
+  display.setTextSize(1);
+
+  // Time on left
+  String ts = currentTimeStr();
+  display.setCursor(2, 9);
+  display.print(ts);
+
+  // Battery % on right
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d%%", battPct);
+  int16_t x1, y1; uint16_t tw, th;
+  display.getTextBounds(buf, 0, 0, &x1, &y1, &tw, &th);
+  display.setCursor(SCREEN_W - (int)tw - 2, 9);
+  display.print(buf);
+
+  // Battery icon left of %
+  int bx = SCREEN_W - (int)tw - 16;
+  display.drawRect(bx, 3, 11, 6, GxEPD_BLACK);
+  display.drawRect(bx + 11, 4, 2, 4, GxEPD_BLACK);
+  int fill = constrain((int)(battPct / 100.0f * 9), 0, 9);
+  if (fill > 0) display.fillRect(bx + 1, 4, fill, 4, GxEPD_BLACK);
+
+  display.drawFastHLine(0, 14, SCREEN_W, GxEPD_BLACK);
 }
 
 // ─── Splash ───────────────────────────────────────────────────────────────────
@@ -165,17 +266,16 @@ void drawShutdown() {
 }
 
 // ─── Match render ─────────────────────────────────────────────────────────────
-void renderMatch(JsonObject match) {
+void renderMatch(JsonObject match, int battPct) {
   String homeName  = match["home_team_name_en"] | "?";
   String awayName  = match["away_team_name_en"] | "?";
-  // score can be null (not started) — default to "-"
-  const char* hs = match["home_score"];
-  const char* as_ = match["away_score"];
-  String homeScore = hs ? String(hs) : "-";
+  const char* hs   = match["home_score"];
+  const char* as_  = match["away_score"];
+  String homeScore = hs  ? String(hs)  : "-";
   String awayScore = as_ ? String(as_) : "-";
-  String group    = match["group"] | "";
-  String matchday = match["matchday"] | "";
-  String elapsed  = match["time_elapsed"] | "";
+  String group     = match["group"]    | "";
+  String matchday  = match["matchday"] | "";
+  String elapsed   = match["time_elapsed"] | "";
 
   String homeSc = "null", awaySc = "null";
   if (match["home_scorers"].is<const char*>()) homeSc = match["home_scorers"].as<String>();
@@ -184,69 +284,53 @@ void renderMatch(JsonObject match) {
   String hScorer = scorerSummary(homeSc);
   String aScorer = scorerSummary(awaySc);
 
-  String statusLabel = (elapsed == "finished")   ? "FT" :
-                       (elapsed == "live")        ? "* LIVE" :
-                       (elapsed == "notstarted")  ? "Upcoming" : elapsed;
+  String statusLabel = (elapsed == "finished")  ? "FT" :
+                       (elapsed == "live")       ? "* LIVE" :
+                       (elapsed == "notstarted") ? "Upcoming" : elapsed;
   String scoreStr = homeScore + "  -  " + awayScore;
   String footer   = "Group " + group + "  MD" + matchday;
+
+  // Check for score change and beep
+  int hScore = hs  ? atoi(hs)  : -1;
+  int aScore = as_ ? atoi(as_) : -1;
+  int mid    = atoi(match["id"] | "0");
+  if (mid == lastMatchId && (hScore != lastHomeScore || aScore != lastAwayScore)
+      && lastHomeScore >= 0) {
+    scoreBeep();
+  }
+  lastMatchId   = mid;
+  lastHomeScore = hScore;
+  lastAwayScore = aScore;
 
   display.setFullWindow();
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
 
-    // Team names
-    leftText(trunc(homeName, 10).c_str(),  6,            30, &FreeSans9pt7b);
-    rightText(trunc(awayName, 10).c_str(), SCREEN_W - 6, 30, &FreeSans9pt7b);
-    display.drawFastHLine(6, 36, SCREEN_W - 12, GxEPD_BLACK);
+    drawStatusBar(battPct);
+
+    // Team names (below status bar, offset by 16px)
+    leftText(trunc(homeName, 10).c_str(),  6,            46, &FreeSans9pt7b);
+    rightText(trunc(awayName, 10).c_str(), SCREEN_W - 6, 46, &FreeSans9pt7b);
+    display.drawFastHLine(6, 52, SCREEN_W - 12, GxEPD_BLACK);
 
     // Score
-    centreText(scoreStr.c_str(), 90, &FreeMonoBold18pt7b);
-    display.drawFastHLine(6, 100, SCREEN_W - 12, GxEPD_BLACK);
+    centreText(scoreStr.c_str(), 106, &FreeMonoBold18pt7b);
+    display.drawFastHLine(6, 116, SCREEN_W - 12, GxEPD_BLACK);
 
     // Scorers
-    if (hScorer.length()) leftText(trunc(hScorer, 16).c_str(),  6,            125, &FreeSans9pt7b);
-    if (aScorer.length()) rightText(trunc(aScorer, 16).c_str(), SCREEN_W - 6, 125, &FreeSans9pt7b);
-    display.drawFastHLine(6, 134, SCREEN_W - 12, GxEPD_BLACK);
+    if (hScorer.length()) leftText(trunc(hScorer, 16).c_str(),  6,            141, &FreeSans9pt7b);
+    if (aScorer.length()) rightText(trunc(aScorer, 16).c_str(), SCREEN_W - 6, 141, &FreeSans9pt7b);
+    display.drawFastHLine(6, 150, SCREEN_W - 12, GxEPD_BLACK);
 
     // Status + footer
-    centreText(statusLabel.c_str(), 160, &FreeSans9pt7b);
-    centreText(footer.c_str(),      185, &FreeSans9pt7b);
+    centreText(statusLabel.c_str(), 173, &FreeSans9pt7b);
+    centreText(footer.c_str(),      193, &FreeSans9pt7b);
 
   } while (display.nextPage());
 }
 
-// ─── LED & power button ───────────────────────────────────────────────────────
-void ledOn()  { digitalWrite(LED_PIN, HIGH); }
-void ledOff() { digitalWrite(LED_PIN, LOW);  }
-
-// Background task: watches for long-press on PWR button → flash LED → deep sleep
-void pwrButtonTask(void*) {
-  for (;;) {
-    if (digitalRead(PWR_BTN_PIN) == LOW) {
-      // Wait to confirm it's a long press (>2s)
-      unsigned long t0 = millis();
-      while (digitalRead(PWR_BTN_PIN) == LOW) {
-        if (millis() - t0 > 2000) {
-          // Flash LED 3x then sleep
-          for (int i = 0; i < 3; i++) {
-            ledOff(); delay(200);
-            ledOn();  delay(200);
-          }
-          ledOff();
-          Serial.println("Power off");
-          drawShutdown();
-          digitalWrite(PWR_LATCH, LOW);  // release latch — battery IC cuts power
-          delay(500);
-          esp_deep_sleep_start();        // fallback if latch didn't cut power
-        }
-        delay(10);
-      }
-    }
-    delay(20);
-  }
-}
-
+// ─── Error screen ─────────────────────────────────────────────────────────────
 void showError(const char* msg) {
   display.setFullWindow();
   display.firstPage();
@@ -256,72 +340,207 @@ void showError(const char* msg) {
   } while (display.nextPage());
 }
 
+// ─── QR code for captive portal ───────────────────────────────────────────────
+void drawPortalQR() {
+  QRCode qr;
+  uint8_t qrData[qrcode_getBufferSize(4)];
+  qrcode_initText(&qr, qrData, 4, ECC_LOW, PORTAL_URL);
+
+  int scale = constrain((SCREEN_H - 30) / qr.size, 1, 6);
+  int qrPx  = qr.size * scale;
+  int ox    = (SCREEN_W - qrPx) / 2;
+  int oy    = 18;
+
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setFont(nullptr);
+    display.setTextSize(1);
+    display.setTextColor(GxEPD_BLACK);
+
+    const char* label = "No WiFi - scan to setup";
+    int16_t x1, y1; uint16_t tw, th;
+    display.getTextBounds(label, 0, 0, &x1, &y1, &tw, &th);
+    display.setCursor((SCREEN_W - tw) / 2, 9);
+    display.print(label);
+
+    for (uint8_t r = 0; r < qr.size; r++)
+      for (uint8_t c = 0; c < qr.size; c++)
+        if (qrcode_getModule(&qr, c, r))
+          display.fillRect(ox + c * scale, oy + r * scale, scale, scale, GxEPD_BLACK);
+
+    display.getTextBounds(PORTAL_URL, 0, 0, &x1, &y1, &tw, &th);
+    display.setCursor((SCREEN_W - tw) / 2, SCREEN_H - 3);
+    display.print(PORTAL_URL);
+  } while (display.nextPage());
+}
+
+// ─── Captive portal (AP mode WiFi setup) ─────────────────────────────────────
+// Shows QR on screen, starts AP + DNS + web server.
+// User scans QR → phone opens captive portal → picks network + enters password.
+// Saves to NVS then reboots.
+void runCaptivePortal() {
+  drawPortalQR();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID);
+  delay(500);
+
+  DNSServer  dns;
+  WebServer  server(80);
+  Preferences prefs;
+
+  dns.start(53, "*", WiFi.softAPIP());
+
+  // Scan nearby networks for the dropdown
+  int n = WiFi.scanNetworks();
+  String options;
+  for (int i = 0; i < n; i++) {
+    options += "<option value=\"" + WiFi.SSID(i) + "\">" +
+               WiFi.SSID(i) + " (" + WiFi.RSSI(i) + " dBm)</option>\n";
+  }
+
+  String page = R"(<!DOCTYPE html><html><head>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>WorldCup2026 WiFi Setup</title>
+<style>body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:0 16px}
+input,select{width:100%;padding:8px;margin:8px 0;box-sizing:border-box}
+button{width:100%;padding:10px;background:#1a6b3a;color:#fff;border:none;border-radius:4px;font-size:16px}
+</style></head><body>
+<h2>&#9917; WorldCup2026 WiFi Setup</h2>
+<form method='POST' action='/save'>
+<label>Network</label>
+<select name='ssid'>)" + options + R"(</select>
+<label>Password</label>
+<input type='password' name='pass' placeholder='WiFi password'>
+<br><br><button type='submit'>Save &amp; Connect</button>
+</form></body></html>)";
+
+  server.on("/", HTTP_GET,  [&]() { server.send(200, "text/html", page); });
+  server.on("/save", HTTP_POST, [&]() {
+    String ssid = server.arg("ssid");
+    String pass = server.arg("pass");
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    prefs.end();
+    server.send(200, "text/html",
+      "<html><body><h2>Saved! Device rebooting...</h2></body></html>");
+    delay(1500);
+    ESP.restart();
+  });
+  // Redirect all other paths to root (captive portal behaviour)
+  server.onNotFound([&]() {
+    server.sendHeader("Location", String("http://") + AP_IP, true);
+    server.send(302, "text/plain", "");
+  });
+
+  server.begin();
+  Serial.println("Captive portal running at " PORTAL_URL);
+
+  while (true) {
+    dns.processNextRequest();
+    server.handleClient();
+    delay(2);
+  }
+}
+
+// ─── WiFi connect (checks NVS first, falls back to secrets.h) ─────────────────
+bool connectWiFi() {
+  Preferences prefs;
+  prefs.begin("wifi", true);
+  String ssid = prefs.getString("ssid", WIFI_SSID);
+  String pass = prefs.getString("pass", WIFI_PASSWORD);
+  prefs.end();
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  Serial.printf("Connecting to %s\n", ssid.c_str());
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(100);
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// ─── LED & power button ───────────────────────────────────────────────────────
+void ledOn()  { digitalWrite(LED_PIN, HIGH); }
+void ledOff() { digitalWrite(LED_PIN, LOW);  }
+
+void pwrButtonTask(void*) {
+  for (;;) {
+    if (digitalRead(PWR_BTN_PIN) == LOW) {
+      unsigned long t0 = millis();
+      while (digitalRead(PWR_BTN_PIN) == LOW) {
+        if (millis() - t0 > 2000) {
+          for (int i = 0; i < 3; i++) { ledOff(); delay(200); ledOn(); delay(200); }
+          ledOff();
+          Serial.println("Power off");
+          drawShutdown();
+          digitalWrite(PWR_LATCH, LOW);
+          delay(500);
+          esp_deep_sleep_start();
+        }
+        delay(10);
+      }
+    }
+    delay(20);
+  }
+}
+
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
 
-  // Hold power latch HIGH immediately — keeps board on after button release
-  pinMode(PWR_LATCH, OUTPUT);
-  digitalWrite(PWR_LATCH, HIGH);
-
-  // LED on immediately to indicate boot
-  pinMode(LED_PIN, OUTPUT);
-  ledOn();
-
-  // Power button input with pull-up
+  pinMode(PWR_LATCH,   OUTPUT); digitalWrite(PWR_LATCH, HIGH);
+  pinMode(LED_PIN,     OUTPUT); ledOn();
   pinMode(PWR_BTN_PIN, INPUT_PULLUP);
-
-  // EPD3V3_EN is active-LOW — LOW = display ON
-  pinMode(EPD_PWR, OUTPUT);
-  digitalWrite(EPD_PWR, LOW);
+  pinMode(BUZZER_PIN,  OUTPUT); digitalWrite(BUZZER_PIN, LOW);
+  pinMode(EPD_PWR,     OUTPUT); digitalWrite(EPD_PWR, LOW);
   delay(20);
 
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
   display.init(115200, true, 2, false);
   display.setRotation(0);
 
-  // Start power button watcher
   xTaskCreate(pwrButtonTask, "pwr", 2048, nullptr, 1, nullptr);
 
-  drawSplash();
-  Serial.println("Splash shown");
-  delay(2000);  // LED on + splash visible for 2s before proceeding
-
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.printf("Connecting to %s\n", WIFI_SSID);
-  {
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(100);
+  if (firstBoot) {
+    drawSplash();
+    delay(2000);
+    firstBoot = false;
   }
 
-  if (WiFi.status() != WL_CONNECTED) { showError("WiFi failed"); goto sleep; }
+  int battPct = batteryPercent();
+  Serial.printf("Battery: %d%%\n", battPct);
+
+  if (!connectWiFi()) {
+    Serial.println("WiFi failed — starting captive portal");
+    runCaptivePortal();  // never returns
+    return;
+  }
   Serial.println("WiFi: " + WiFi.localIP().toString());
+  syncNTP();
 
   {
-    Serial.printf("Heap: %u  PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
-
+    Serial.printf("Heap: %u\n", ESP.getFreeHeap());
     JsonDocument gDoc;
-    Serial.println("Fetching games...");
     if (!httpGetJson(API_GAMES_URL, gDoc)) { showError("API error"); goto sleep; }
 
     JsonArray games = gDoc["games"].as<JsonArray>();
     JsonObject latest;
     int latestId = -1;
-    bool isLive = false;
+    bool isLive  = false;
 
     for (JsonObject g : games) {
       String fin     = g["finished"] | "FALSE";
       String elapsed = g["time_elapsed"] | "";
       int    gid     = atoi(g["id"] | "0");
-
-      // "live" = in progress. "notstarted"/"finished" are excluded from live bucket.
-      bool live     = (fin == "FALSE") && (elapsed == "live");
-      bool finished = (fin == "TRUE");
-
-      if (live && (!isLive || gid > latestId))        { latestId = gid; latest = g; isLive = true; }
+      bool live      = (fin == "FALSE") && (elapsed == "live");
+      bool finished  = (fin == "TRUE");
+      if (live     && (!isLive  || gid > latestId)) { latestId = gid; latest = g; isLive = true; }
       else if (!isLive && finished && gid > latestId) { latestId = gid; latest = g; }
     }
 
@@ -329,11 +548,10 @@ void setup() {
     Serial.printf("%s id=%d  %s %s-%s %s\n",
       isLive ? "LIVE" : "FT", latestId,
       (const char*)latest["home_team_name_en"],
-      latest["home_score"] | "?",
-      latest["away_score"] | "?",
+      latest["home_score"] | "?", latest["away_score"] | "?",
       (const char*)latest["away_team_name_en"]);
 
-    renderMatch(latest);
+    renderMatch(latest, battPct);
   }
 
 sleep:
