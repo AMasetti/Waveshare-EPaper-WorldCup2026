@@ -12,14 +12,28 @@ Shows the most recent or currently live match: team names, score, goalscorers, a
 | **Display** | 1.54" e-Paper 200×200 B/W |
 | **MCU** | ESP32-S3 (Wi-Fi + BLE) |
 
-## Quick Start (Arduino)
+## Quick Start
 
-### Prerequisites
-- [arduino-cli](https://arduino.github.io/arduino-cli/) installed
-- ESP32 Arduino core (`esp32:esp32`)
-- Libraries: `GxEPD2`, `ArduinoJson` (see `src/arduino/libraries.txt`)
+### Option A — Flash a release (no source editing required)
 
-### Flash
+1. Install [arduino-cli](https://arduino.github.io/arduino-cli/)
+2. Clone this repo and install dependencies once:
+
+```bash
+git clone https://github.com/AMasetti/Waveshare-EPaper-WorldCup2026.git
+cd Waveshare-EPaper-WorldCup2026
+make setup
+```
+
+3. Connect the board via USB-C, then flash any release with your WiFi credentials:
+
+```bash
+make flash-version VERSION=v1.0.0 SSID="MyNetwork" PASSWORD="mypass"
+```
+
+That's it — downloads the source for that version, compiles with your credentials, and flashes the board automatically.
+
+### Option B — Build from source
 
 1. Copy `src/arduino/secrets.h.example` to `src/arduino/secrets.h` and fill in your WiFi credentials
 2. Connect the board via USB-C
