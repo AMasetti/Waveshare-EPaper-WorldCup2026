@@ -1,0 +1,10 @@
+board_manager:
+  additional_urls:
+    - https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+# Dependencies for this project:
+#   GxEPD2        — e-paper driver
+#   ArduinoJson   — JSON parsing
+#   TJpg_Decoder  — JPEG decode for flag images
+#
+# Install with: make arduino-install-deps-worldcup

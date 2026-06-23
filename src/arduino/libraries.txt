@@ -1,0 +1,4 @@
+# Arduino library dependencies for CI
+# One entry per line: "LibraryName" or "LibraryName@version"
+GxEPD2
+ArduinoJson

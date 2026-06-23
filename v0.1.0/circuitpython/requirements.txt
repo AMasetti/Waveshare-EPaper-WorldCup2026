@@ -1,0 +1,2 @@
+# CircuitPython library dependencies
+# Install with: circup install -r requirements.txt

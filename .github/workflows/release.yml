@@ -1,0 +1,62 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  arduino:
+    name: Arduino — compile & release .bin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index --config-file src/arduino/arduino_cli_config.yaml
+          arduino-cli core install esp32:esp32 --config-file src/arduino/arduino_cli_config.yaml
+
+      - name: Install libraries
+        run: |
+          if [ -f src/arduino/libraries.txt ]; then
+            while IFS= read -r lib || [ -n "$lib" ]; do
+              [[ "$lib" =~ ^#.*$ || -z "$lib" ]] && continue
+              arduino-cli lib install "$lib"
+            done < src/arduino/libraries.txt
+          fi
+
+      - name: Compile
+        run: |
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc \
+            --config-file src/arduino/arduino_cli_config.yaml \
+            --output-dir out/ \
+            src/arduino
+
+      - name: Create GitHub Release (Arduino)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.bin
+          generate_release_notes: true
+
+  circuitpython:
+    name: CircuitPython — package & release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package CircuitPython
+        run: |
+          zip -j circuitpython-${{ github.ref_name }}.zip \
+            src/circuitpython/code.py \
+            src/circuitpython/requirements.txt
+
+      - name: Create GitHub Release (CircuitPython)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: circuitpython-${{ github.ref_name }}.zip
+          generate_release_notes: true
