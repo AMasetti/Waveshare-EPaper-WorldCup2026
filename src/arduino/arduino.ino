@@ -228,22 +228,20 @@ String currentTimeStr() {
 }
 
 // ─── Status bar ───────────────────────────────────────────────────────────────
-// Built-in 5x7 font: glyph is 7px tall (rows 0-6 relative to top).
-// GFX draws with baseline at cursor_y: top of glyph = cursor_y - 6.
-// STATUS_H=16. To vertically center: cursor_y = (16 - 7) / 2 + 6 = 10.
-// Battery icon h=7, center: iconY = (16 - 7) / 2 = 4.
-#define STATUS_H 16
+// Built-in font (setFont nullptr): setCursor(x,y) places TOP-LEFT of glyph at (x,y).
+// Glyph is 7px tall. STATUS_H=20. Center: top at (20-7)/2 = 6. Line at 20.
+#define STATUS_H 20
 void drawStatusBar(int battPct) {
   display.setFont(nullptr);
   display.setTextColor(GxEPD_BLACK);
   display.setTextSize(1);
 
-  const int textY = 10;   // baseline for 5x7 font, centers glyph in 16px bar
-  const int iconY =  4;   // top of 7px-tall battery icon, centered in 16px bar
+  const int textY = (STATUS_H - 7) / 2;  // = 6: top of 7px glyph centered in 20px bar
   const int iconH =  7;
   const int iconW = 11;
   const int nubW  =  2;
   const int nubH  =  3;
+  const int iconY = (STATUS_H - iconH) / 2;  // = 6
 
   // Time on left
   String ts = currentTimeStr();
@@ -259,17 +257,14 @@ void drawStatusBar(int battPct) {
   display.setCursor(pctX, textY);
   display.print(buf);
 
-  // Battery body just left of % text
+  // Battery icon just left of % text
   int bx = pctX - iconW - nubW - 2;
   int by = iconY;
   display.drawRect(bx, by, iconW, iconH, GxEPD_BLACK);
-  // Nub on right, centered vertically on icon
   display.drawRect(bx + iconW, by + (iconH - nubH) / 2, nubW, nubH, GxEPD_BLACK);
-  // Fill proportional to charge (inner area is iconW-2 wide, iconH-2 tall)
   int fill = constrain((int)(battPct / 100.0f * (iconW - 2)), 0, iconW - 2);
   if (fill > 0) display.fillRect(bx + 1, by + 1, fill, iconH - 2, GxEPD_BLACK);
 
-  // Separator line flush below bar
   display.drawFastHLine(0, STATUS_H, SCREEN_W, GxEPD_BLACK);
 }
 
@@ -358,23 +353,28 @@ void renderMatch(JsonObject match, int battPct) {
     //   Scorers: top at 88 → baseline = 88+12 = 100, sep at 104
     //   Remaining 96px (104-200): status at 148, footer at 178
 
-    // Team names
-    leftText(trunc(homeName, 10).c_str(),  6,            30, &FreeSans9pt7b);
-    rightText(trunc(awayName, 10).c_str(), SCREEN_W - 6, 30, &FreeSans9pt7b);
-    display.drawFastHLine(0, 34, SCREEN_W, GxEPD_BLACK);
+    // FreeSans9pt7b: caps yOffset=-12, h=13 → at baseline y: top=y-12, bottom=y+1
+    // FreeMonoBold18pt7b: digits yOffset=-22, h=23 → top=y-22, bottom=y+1
+    // Lines drawn 4px below baseline (clear of descenders).
+    // STATUS_H=20, so content starts at y=20.
 
-    // Score
-    centreText(scoreStr.c_str(), 82, &FreeMonoBold18pt7b);
-    display.drawFastHLine(0, 86, SCREEN_W, GxEPD_BLACK);
+    // Team names: top at 24 → baseline = 24+12 = 36, line at 40
+    leftText(trunc(homeName, 10).c_str(),  6,            36, &FreeSans9pt7b);
+    rightText(trunc(awayName, 10).c_str(), SCREEN_W - 6, 36, &FreeSans9pt7b);
+    display.drawFastHLine(0, 40, SCREEN_W, GxEPD_BLACK);
 
-    // Scorers
-    if (hScorer.length()) leftText(trunc(hScorer, 16).c_str(),  6,            100, &FreeSans9pt7b);
-    if (aScorer.length()) rightText(trunc(aScorer, 16).c_str(), SCREEN_W - 6, 100, &FreeSans9pt7b);
-    display.drawFastHLine(0, 104, SCREEN_W, GxEPD_BLACK);
+    // Score: top at 44 → baseline = 44+22 = 66... centre at 88 looks better
+    centreText(scoreStr.c_str(), 88, &FreeMonoBold18pt7b);
+    display.drawFastHLine(0, 92, SCREEN_W, GxEPD_BLACK);
 
-    // Status + footer
-    centreText(statusLabel.c_str(), 148, &FreeSans9pt7b);
-    centreText(footer.c_str(),      178, &FreeSans9pt7b);
+    // Scorers: top at 96 → baseline = 96+12 = 108, line at 112
+    if (hScorer.length()) leftText(trunc(hScorer, 16).c_str(),  6,            108, &FreeSans9pt7b);
+    if (aScorer.length()) rightText(trunc(aScorer, 16).c_str(), SCREEN_W - 6, 108, &FreeSans9pt7b);
+    display.drawFastHLine(0, 112, SCREEN_W, GxEPD_BLACK);
+
+    // Status + footer: 88px remaining (112–200), evenly spaced
+    centreText(statusLabel.c_str(), 152, &FreeSans9pt7b);
+    centreText(footer.c_str(),      182, &FreeSans9pt7b);
 
   } while (display.nextPage());
 }
