@@ -206,34 +206,46 @@ String currentTimeStr() {
   return String(buf);
 }
 
-// ─── Status bar (top 14px) ────────────────────────────────────────────────────
-// Left: HH:MM (UTC)   Right: battery icon + %
+// ─── Status bar (16px tall) ───────────────────────────────────────────────────
+// Built-in 5x7 font: baseline at cursor_y, cap top = cursor_y - 6.
+// Bar height = 16px. Center text vertically: cursor_y = (16 + 6) / 2 = 11.
+// Battery icon (w=12, h=7) centered: icon_y = (16 - 7) / 2 = 4.
+#define STATUS_H 16
 void drawStatusBar(int battPct) {
   display.setFont(nullptr);
   display.setTextColor(GxEPD_BLACK);
   display.setTextSize(1);
 
+  const int textY  = 11;  // baseline — centers 7px-tall glyphs in STATUS_H
+  const int iconY  =  4;  // top of battery icon
+  const int iconH  =  7;
+  const int iconW  = 12;
+  const int nubW   =  2;
+  const int nubH   =  4;
+
   // Time on left
   String ts = currentTimeStr();
-  display.setCursor(2, 9);
+  display.setCursor(2, textY);
   display.print(ts);
 
-  // Battery % on right
+  // Battery % text on right
   char buf[8];
   snprintf(buf, sizeof(buf), "%d%%", battPct);
   int16_t x1, y1; uint16_t tw, th;
   display.getTextBounds(buf, 0, 0, &x1, &y1, &tw, &th);
-  display.setCursor(SCREEN_W - (int)tw - 2, 9);
+  int textX = SCREEN_W - (int)tw - 2;
+  display.setCursor(textX, textY);
   display.print(buf);
 
-  // Battery icon left of %
-  int bx = SCREEN_W - (int)tw - 16;
-  display.drawRect(bx, 3, 11, 6, GxEPD_BLACK);
-  display.drawRect(bx + 11, 4, 2, 4, GxEPD_BLACK);
-  int fill = constrain((int)(battPct / 100.0f * 9), 0, 9);
-  if (fill > 0) display.fillRect(bx + 1, 4, fill, 4, GxEPD_BLACK);
+  // Battery icon just left of % text, vertically centered
+  int bx = textX - iconW - nubW - 3;
+  int by = iconY;
+  display.drawRect(bx, by, iconW, iconH, GxEPD_BLACK);
+  display.drawRect(bx + iconW, by + (iconH - nubH) / 2, nubW, nubH, GxEPD_BLACK);
+  int fill = constrain((int)(battPct / 100.0f * (iconW - 2)), 0, iconW - 2);
+  if (fill > 0) display.fillRect(bx + 1, by + 1, fill, iconH - 2, GxEPD_BLACK);
 
-  display.drawFastHLine(0, 14, SCREEN_W, GxEPD_BLACK);
+  display.drawFastHLine(0, STATUS_H, SCREEN_W, GxEPD_BLACK);
 }
 
 // ─── Splash ───────────────────────────────────────────────────────────────────
@@ -309,23 +321,28 @@ void renderMatch(JsonObject match, int battPct) {
 
     drawStatusBar(battPct);
 
-    // Team names (below status bar, offset by 16px)
-    leftText(trunc(homeName, 10).c_str(),  6,            46, &FreeSans9pt7b);
-    rightText(trunc(awayName, 10).c_str(), SCREEN_W - 6, 46, &FreeSans9pt7b);
-    display.drawFastHLine(6, 52, SCREEN_W - 12, GxEPD_BLACK);
+    // Layout below status bar (STATUS_H=16):
+    // FreeSans9pt7b: ascender ~13px above baseline, descender ~3px below.
+    // FreeMonoBold18pt7b: ascender ~24px above baseline.
+    // Lines are drawn 4px below each section's baseline.
 
-    // Score
-    centreText(scoreStr.c_str(), 106, &FreeMonoBold18pt7b);
-    display.drawFastHLine(6, 116, SCREEN_W - 12, GxEPD_BLACK);
+    // Team names — baseline at y=36, line at y=42
+    leftText(trunc(homeName, 10).c_str(),  6,            36, &FreeSans9pt7b);
+    rightText(trunc(awayName, 10).c_str(), SCREEN_W - 6, 36, &FreeSans9pt7b);
+    display.drawFastHLine(6, 42, SCREEN_W - 12, GxEPD_BLACK);
 
-    // Scorers
-    if (hScorer.length()) leftText(trunc(hScorer, 16).c_str(),  6,            141, &FreeSans9pt7b);
-    if (aScorer.length()) rightText(trunc(aScorer, 16).c_str(), SCREEN_W - 6, 141, &FreeSans9pt7b);
-    display.drawFastHLine(6, 150, SCREEN_W - 12, GxEPD_BLACK);
+    // Score — baseline at y=95, line at y=103
+    centreText(scoreStr.c_str(), 95, &FreeMonoBold18pt7b);
+    display.drawFastHLine(6, 103, SCREEN_W - 12, GxEPD_BLACK);
 
-    // Status + footer
-    centreText(statusLabel.c_str(), 173, &FreeSans9pt7b);
-    centreText(footer.c_str(),      193, &FreeSans9pt7b);
+    // Scorers — baseline at y=124, line at y=130
+    if (hScorer.length()) leftText(trunc(hScorer, 16).c_str(),  6,            124, &FreeSans9pt7b);
+    if (aScorer.length()) rightText(trunc(aScorer, 16).c_str(), SCREEN_W - 6, 124, &FreeSans9pt7b);
+    display.drawFastHLine(6, 130, SCREEN_W - 12, GxEPD_BLACK);
+
+    // Status + footer — evenly spaced in remaining 70px (130–200)
+    centreText(statusLabel.c_str(), 158, &FreeSans9pt7b);
+    centreText(footer.c_str(),      183, &FreeSans9pt7b);
 
   } while (display.nextPage());
 }
