@@ -42,9 +42,10 @@
 #define REFRESH_LIVE_US   (60ULL  * 1000000ULL)   // 60s  — during live match
 #define REFRESH_IDLE_US   (300ULL * 1000000ULL)   // 5min — finished/upcoming
 #define NTP_RESYNC_S      3600                     // re-sync NTP once per hour
-#define AP_SSID           "WorldCup2026-Setup"
+#define AP_SSID           "epaper-hs"
 #define AP_IP             "192.168.4.1"
 #define PORTAL_URL        "http://" AP_IP
+#define TZ_OFFSET_S       (-3 * 3600)   // UTC-3 Buenos Aires (no DST)
 
 // ─── RTC memory — survives deep sleep / restart, cleared on power-cycle ───────
 RTC_DATA_ATTR bool     firstBoot      = true;
@@ -203,7 +204,7 @@ void maybeNTP() {
                   (sleepStartEpoch > 0 &&
                    sleepStartEpoch - lastNtpEpoch > NTP_RESYNC_S);
   if (needSync) {
-    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    configTime(TZ_OFFSET_S, 0, "pool.ntp.org", "time.google.com");
     unsigned long t0 = millis();
     while (!getLocalTime(&t) && millis() - t0 < 5000) delay(100);
     if (getLocalTime(&t)) {
@@ -389,15 +390,20 @@ void showError(const char* msg) {
 }
 
 // ─── QR code for captive portal ───────────────────────────────────────────────
+// Layout (built-in 5x7 font, textSize=1, each line ~9px tall):
+//   y=9:  "Connect to: epaper-hs"
+//   y=18: "then scan QR"
+//   QR centered between y=20 and y=185
+//   y=196: "http://192.168.4.1"
 void drawPortalQR() {
   QRCode qr;
   uint8_t qrData[qrcode_getBufferSize(4)];
   qrcode_initText(&qr, qrData, 4, ECC_LOW, PORTAL_URL);
 
-  int scale = constrain((SCREEN_H - 30) / qr.size, 1, 6);
+  int scale = constrain(160 / qr.size, 1, 6);
   int qrPx  = qr.size * scale;
   int ox    = (SCREEN_W - qrPx) / 2;
-  int oy    = 18;
+  int oy    = 22;
 
   display.setFullWindow();
   display.firstPage();
@@ -407,11 +413,17 @@ void drawPortalQR() {
     display.setTextSize(1);
     display.setTextColor(GxEPD_BLACK);
 
-    const char* label = "No WiFi - scan to setup";
     int16_t x1, y1; uint16_t tw, th;
-    display.getTextBounds(label, 0, 0, &x1, &y1, &tw, &th);
-    display.setCursor((SCREEN_W - tw) / 2, 9);
-    display.print(label);
+
+    const char* line1 = "Connect to WiFi: " AP_SSID;
+    display.getTextBounds(line1, 0, 0, &x1, &y1, &tw, &th);
+    display.setCursor((SCREEN_W - tw) / 2, 8);
+    display.print(line1);
+
+    const char* line2 = "then scan QR code";
+    display.getTextBounds(line2, 0, 0, &x1, &y1, &tw, &th);
+    display.setCursor((SCREEN_W - tw) / 2, 17);
+    display.print(line2);
 
     for (uint8_t r = 0; r < qr.size; r++)
       for (uint8_t c = 0; c < qr.size; c++)
@@ -429,11 +441,15 @@ void drawPortalQR() {
 // User scans QR → phone opens captive portal → picks network + enters password.
 // Saves to NVS then reboots.
 void runCaptivePortal() {
-  drawPortalQR();
-
+  // Clean WiFi state before switching to AP mode
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID);
   delay(500);
+
+  drawPortalQR();
 
   DNSServer  dns;
   WebServer  server(80);
