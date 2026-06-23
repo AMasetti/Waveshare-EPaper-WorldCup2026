@@ -29,6 +29,11 @@ jobs:
             done < src/arduino/libraries.txt
           fi
 
+      - name: Create secrets.h stub for CI
+        run: |
+          printf '#define WIFI_SSID ""\n#define WIFI_PASSWORD ""\n' \
+            > src/arduino/secrets.h
+
       - name: Compile
         run: |
           arduino-cli compile \
