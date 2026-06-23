@@ -39,17 +39,21 @@
 #define SCREEN_W        200
 #define SCREEN_H        200
 #define API_GAMES_URL   "https://worldcup26.ir/get/games"
-#define REFRESH_SECONDS 60
-#define AP_SSID         "WorldCup2026-Setup"
-#define AP_IP           "192.168.4.1"
-#define PORTAL_URL      "http://" AP_IP
+#define REFRESH_LIVE_US   (60ULL  * 1000000ULL)   // 60s  — during live match
+#define REFRESH_IDLE_US   (300ULL * 1000000ULL)   // 5min — finished/upcoming
+#define NTP_RESYNC_S      3600                     // re-sync NTP once per hour
+#define AP_SSID           "WorldCup2026-Setup"
+#define AP_IP             "192.168.4.1"
+#define PORTAL_URL        "http://" AP_IP
 
 // ─── RTC memory — survives deep sleep / restart, cleared on power-cycle ───────
-RTC_DATA_ATTR bool  firstBoot     = true;
-RTC_DATA_ATTR int   lastHomeScore = -1;
-RTC_DATA_ATTR int   lastAwayScore = -1;
-RTC_DATA_ATTR int   lastMatchId   = -1;
-RTC_DATA_ATTR bool  ntpSynced     = false;
+RTC_DATA_ATTR bool     firstBoot      = true;
+RTC_DATA_ATTR int      lastHomeScore  = -1;
+RTC_DATA_ATTR int      lastAwayScore  = -1;
+RTC_DATA_ATTR int      lastMatchId    = -1;
+RTC_DATA_ATTR bool     ntpSynced      = false;
+RTC_DATA_ATTR uint32_t lastNtpEpoch   = 0;    // unix time of last NTP sync
+RTC_DATA_ATTR uint32_t sleepStartEpoch = 0;   // used to advance time across sleeps
 
 // ─── Display ──────────────────────────────────────────────────────────────────
 GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> display(
@@ -184,16 +188,32 @@ String scorerSummary(const String& raw) {
 }
 
 // ─── NTP ──────────────────────────────────────────────────────────────────────
-void syncNTP() {
-  configTime(0, 0, "pool.ntp.org", "time.google.com");
+// Syncs from network only when needed; otherwise advances from RTC memory.
+void maybeNTP() {
   struct tm t;
-  unsigned long t0 = millis();
-  while (!getLocalTime(&t) && millis() - t0 < 5000) delay(100);
-  if (getLocalTime(&t)) {
-    ntpSynced = true;
-    Serial.printf("NTP: %02d:%02d UTC\n", t.tm_hour, t.tm_min);
-  } else {
-    Serial.println("NTP sync failed");
+  uint32_t now = (uint32_t)(millis() / 1000);
+
+  // Advance system clock from last known epoch + sleep duration
+  if (ntpSynced && sleepStartEpoch > 0) {
+    struct timeval tv = { (time_t)sleepStartEpoch, 0 };
+    settimeofday(&tv, nullptr);
+  }
+
+  bool needSync = !ntpSynced ||
+                  (sleepStartEpoch > 0 &&
+                   sleepStartEpoch - lastNtpEpoch > NTP_RESYNC_S);
+  if (needSync) {
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    unsigned long t0 = millis();
+    while (!getLocalTime(&t) && millis() - t0 < 5000) delay(100);
+    if (getLocalTime(&t)) {
+      ntpSynced   = true;
+      time_t epoch; time(&epoch);
+      lastNtpEpoch = (uint32_t)epoch;
+      Serial.printf("NTP sync: %02d:%02d UTC\n", t.tm_hour, t.tm_min);
+    } else {
+      Serial.println("NTP sync failed");
+    }
   }
 }
 
@@ -484,7 +504,7 @@ bool connectWiFi() {
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
+  WiFi.setSleep(true);   // modem sleep OK during connect — saves power
   WiFi.begin(ssid.c_str(), pass.c_str());
   Serial.printf("Connecting to %s\n", ssid.c_str());
 
@@ -533,6 +553,21 @@ void setup() {
   display.init(115200, true, 2, false);
   display.setRotation(0);
 
+  // If woken by power button (not timer), show shutdown screen and power off
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
+    // Wait for long-press confirmation (>1s still held)
+    delay(1000);
+    if (digitalRead(PWR_BTN_PIN) == LOW) {
+      for (int i = 0; i < 3; i++) { ledOff(); delay(200); ledOn(); delay(200); }
+      ledOff();
+      drawShutdown();
+      digitalWrite(PWR_LATCH, LOW);
+      delay(500);
+      esp_deep_sleep_start();
+    }
+    // Short press — fall through to normal refresh
+  }
+
   xTaskCreate(pwrButtonTask, "pwr", 2048, nullptr, 1, nullptr);
 
   if (firstBoot) {
@@ -540,9 +575,12 @@ void setup() {
     delay(2000);
     firstBoot = false;
   }
+  ledOff();  // LED only needed during boot splash
 
   int battPct = batteryPercent();
   Serial.printf("Battery: %d%%\n", battPct);
+
+  uint64_t sleepUs = REFRESH_IDLE_US;  // default; shortened to LIVE if match is live
 
   if (!connectWiFi()) {
     Serial.println("WiFi failed — starting captive portal");
@@ -550,7 +588,7 @@ void setup() {
     return;
   }
   Serial.println("WiFi: " + WiFi.localIP().toString());
-  syncNTP();
+  maybeNTP();
 
   {
     Serial.printf("Heap: %u\n", ESP.getFreeHeap());
@@ -573,21 +611,37 @@ void setup() {
     }
 
     if (latestId < 0) { showError("No matches yet"); goto sleep; }
-    Serial.printf("%s id=%d  %s %s-%s %s\n",
+
+    if (isLive) sleepUs = REFRESH_LIVE_US;   // fast refresh during live match
+
+    Serial.printf("%s id=%d  %s %s-%s %s  next=%llus\n",
       isLive ? "LIVE" : "FT", latestId,
       (const char*)latest["home_team_name_en"],
       latest["home_score"] | "?", latest["away_score"] | "?",
-      (const char*)latest["away_team_name_en"]);
+      (const char*)latest["away_team_name_en"],
+      sleepUs / 1000000ULL);
 
     renderMatch(latest, battPct);
   }
 
 sleep:
+  // Record current epoch so clock can be advanced after wakeup
+  { time_t now; time(&now); sleepStartEpoch = (uint32_t)now + (uint32_t)(sleepUs / 1000000ULL); }
+
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-  Serial.printf("Sleeping %ds\n", REFRESH_SECONDS);
-  delay((uint32_t)REFRESH_SECONDS * 1000);
-  ESP.restart();
+
+  // Power down EPD — holds image with zero power
+  display.hibernate();
+  digitalWrite(EPD_PWR, HIGH);   // active-LOW: HIGH = display off
+
+  Serial.printf("Deep sleep %llus\n", sleepUs / 1000000ULL);
+  Serial.flush();
+
+  esp_sleep_enable_timer_wakeup(sleepUs);
+  // PWR button (IO18, active LOW) wakes from sleep → handled at next boot
+  esp_sleep_enable_ext1_wakeup(1ULL << PWR_BTN_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
+  esp_deep_sleep_start();
 }
 
 void loop() {}
