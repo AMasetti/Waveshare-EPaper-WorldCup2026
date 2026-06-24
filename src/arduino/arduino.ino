@@ -22,6 +22,9 @@
 #include "qrcode.h"
 #include <time.h>
 #include "secrets.h"
+#ifndef PRIVATE_QR_DATA
+#define PRIVATE_QR_DATA "https://example.com"
+#endif
 #include "fifa_logo.h"
 
 // ─── Pin definitions ──────────────────────────────────────────────────────────
