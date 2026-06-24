@@ -1,8 +1,8 @@
-// Project: WorldCup2026  Version: v0.2.0
+// Project: WorldCup2026  Version: v0.3.0
 // Board: Waveshare ESP32-S3-ePaper-1.54 (200x200 B/W)
 // Shows most recent FIFA World Cup 2026 match: team names, score, scorers, status.
 // API: https://worldcup26.ir  (no key required)
-// Libraries: GxEPD2, ArduinoJson, qrcode
+// Libraries: GxEPD2, ArduinoJson, SensorLib, qrcode
 
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -15,6 +15,10 @@
 #include <Preferences.h>
 #include <esp_adc_cal.h>
 #include <driver/adc.h>
+#include <driver/rtc_io.h>   // rtc_gpio_pullup_en — hold wake pins HIGH in deep sleep
+#include <driver/gpio.h>     // gpio_hold_en — latch PWR_LATCH (IO17) through deep sleep
+#include <Wire.h>
+#include <SensorPCF85063.hpp>
 #include "qrcode.h"
 #include <time.h>
 #include "secrets.h"
@@ -32,7 +36,10 @@
 #define LED_PIN      3
 #define PWR_BTN_PIN 18
 #define PWR_LATCH   17
-#define BUZZER_PIN   5   // wire a piezo buzzer between GPIO5 and GND
+#define BOOT_BTN_PIN 0   // GPIO0 — boot button, active LOW
+#define RTC_INT_PIN  5   // PCF85063 interrupt, active LOW, open-drain
+#define RTC_SDA_PIN 47
+#define RTC_SCL_PIN 48
 #define BATT_ADC_CH  ADC1_CHANNEL_3   // GPIO4 — battery voltage divider
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -41,25 +48,31 @@
 #define API_GAMES_URL   "https://worldcup26.ir/get/games"
 #define REFRESH_LIVE_US   (60ULL  * 1000000ULL)   // 60s  — during live match
 #define REFRESH_IDLE_US   (300ULL * 1000000ULL)   // 5min — finished/upcoming
-#define NTP_RESYNC_S      3600                     // re-sync NTP once per hour
 #define AP_SSID           "epaper-hs"
 #define AP_IP             "192.168.4.1"
 #define PORTAL_URL        "http://" AP_IP
 #define TZ_OFFSET_S       (-3 * 3600)   // UTC-3 Buenos Aires (no DST)
 
 // ─── RTC memory — survives deep sleep / restart, cleared on power-cycle ───────
-RTC_DATA_ATTR bool     firstBoot      = true;
-RTC_DATA_ATTR int      lastHomeScore  = -1;
-RTC_DATA_ATTR int      lastAwayScore  = -1;
-RTC_DATA_ATTR int      lastMatchId    = -1;
-RTC_DATA_ATTR bool     ntpSynced      = false;
-RTC_DATA_ATTR uint32_t lastNtpEpoch   = 0;    // unix time of last NTP sync
-RTC_DATA_ATTR uint32_t sleepStartEpoch = 0;   // used to advance time across sleeps
+RTC_DATA_ATTR bool firstBoot     = true;
+RTC_DATA_ATTR int  lastHomeScore = -1;
+RTC_DATA_ATTR int  lastAwayScore = -1;
+RTC_DATA_ATTR int  lastMatchId   = -1;
+RTC_DATA_ATTR bool ntpSynced     = false;
+RTC_DATA_ATTR uint32_t wakeCounter = 0;   // increments each RTC-alarm wake
+RTC_DATA_ATTR bool lastWasLive   = false; // last fetch saw a live match
+
+// ─── PCF85063 RTC ─────────────────────────────────────────────────────────────
+SensorPCF85063 rtc;
 
 // ─── Display ──────────────────────────────────────────────────────────────────
 GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> display(
   GxEPD2_154_D67(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
 );
+
+SemaphoreHandle_t dispMutex;
+#define DISP_TAKE()  xSemaphoreTake(dispMutex, portMAX_DELAY)
+#define DISP_GIVE()  xSemaphoreGive(dispMutex)
 
 // ─── Battery ──────────────────────────────────────────────────────────────────
 // Voltage divider ratio on this board is 2:1 (100k + 100k).
@@ -80,16 +93,9 @@ int batteryPercent() {
   return constrain(pct, 0, 100);
 }
 
-// ─── Buzzer ───────────────────────────────────────────────────────────────────
-void beep(int freq, int ms) {
-  tone(BUZZER_PIN, freq, ms);
-  delay(ms + 20);
-}
-
+// ─── Score alert — flash LED 3× ───────────────────────────────────────────────
 void scoreBeep() {
-  beep(880, 150);
-  beep(1100, 150);
-  beep(1320, 300);
+  for (int i = 0; i < 3; i++) { ledOn(); delay(150); ledOff(); delay(150); }
 }
 
 // ─── HTTP / JSON ──────────────────────────────────────────────────────────────
@@ -188,34 +194,107 @@ String scorerSummary(const String& raw) {
   return result;
 }
 
-// ─── NTP ──────────────────────────────────────────────────────────────────────
-// Syncs from network only when needed; otherwise advances from RTC memory.
-void maybeNTP() {
+// ─── PCF85063 init ────────────────────────────────────────────────────────────
+bool initRTC() {
+  if (!rtc.begin(Wire, RTC_SDA_PIN, RTC_SCL_PIN)) {
+    Serial.println("PCF85063 not found");
+    return false;
+  }
+  rtc.resetAlarm();   // clear the alarm flag that triggered this wakeup
+  Serial.println("PCF85063 ready");
+  return true;
+}
+
+// ─── NTP sync ─────────────────────────────────────────────────────────────────
+// Syncs every wakeup (ESP32 system clock resets on deep-sleep boot).
+// Also writes the synced time into the PCF85063 so setRTCAlarm has accurate
+// current time to compute the target minute/second.
+void syncNTP() {
+  configTime(TZ_OFFSET_S, 0, "pool.ntp.org", "time.google.com");
   struct tm t;
-  uint32_t now = (uint32_t)(millis() / 1000);
+  unsigned long t0 = millis();
+  while (!getLocalTime(&t) && millis() - t0 < 5000) delay(100);
+  if (getLocalTime(&t)) {
+    ntpSynced = true;
+    rtc.setDateTime(RTC_DateTime(t));   // keep PCF85063 in sync for alarm math
+    Serial.printf("NTP: %02d:%02d:%02d\n", t.tm_hour, t.tm_min, t.tm_sec);
+  } else {
+    Serial.println("NTP sync failed");
+  }
+}
 
-  // Advance system clock from last known epoch + sleep duration
-  if (ntpSynced && sleepStartEpoch > 0) {
-    struct timeval tv = { (time_t)sleepStartEpoch, 0 };
-    settimeofday(&tv, nullptr);
+// ─── Set PCF85063 alarm → wakes ESP32 via IO5 EXT1 ──────────────────────────
+// Uses a second-only alarm (Waveshare pattern): fires once per minute when the
+// seconds register matches. Wake cadence (60s live / 5min idle) is managed by
+// wakeCounter in setup — we always arm a 60s-class alarm.
+void setWakeupTimer(uint32_t seconds) {
+  // Disable alarm and clear flag FIRST so INT pin is released HIGH.
+  rtc.disableAlarm();
+  rtc.resetAlarm();
+  delay(5);  // let the I2C write settle and INT pin float back HIGH
+
+  RTC_DateTime now = rtc.getDateTime();
+  if (now.getYear() < 2024) {
+    // RTC not set — fall back to ESP32 internal timer
+    esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+    Serial.printf("RTC fallback: timer %us\n", seconds);
+    return;
   }
 
-  bool needSync = !ntpSynced ||
-                  (sleepStartEpoch > 0 &&
-                   sleepStartEpoch - lastNtpEpoch > NTP_RESYNC_S);
-  if (needSync) {
-    configTime(TZ_OFFSET_S, 0, "pool.ntp.org", "time.google.com");
-    unsigned long t0 = millis();
-    while (!getLocalTime(&t) && millis() - t0 < 5000) delay(100);
-    if (getLocalTime(&t)) {
-      ntpSynced   = true;
-      time_t epoch; time(&epoch);
-      lastNtpEpoch = (uint32_t)epoch;
-      Serial.printf("NTP sync: %02d:%02d UTC\n", t.tm_hour, t.tm_min);
-    } else {
-      Serial.println("NTP sync failed");
-    }
+  // Arm at the CURRENT second value. The PCF85063 second alarm fires once per
+  // minute when SEC register == tSec. So if it's now :23, it fires at :23 next
+  // minute — exactly 60s from now regardless of when in the cycle we arm it.
+  uint8_t tSec = now.getSecond();
+
+  // 1. Arm second-only alarm
+  rtc.setAlarmBySecond(tSec);
+
+  // 2. Disable weekday alarm register — SensorLib never writes reg 0x0F,
+  //    so it defaults to 0x00 (weekday enabled, match Sunday). PCF85063 ANDs
+  //    all enabled fields, so unless it's Sunday the alarm never fires.
+  Wire.beginTransmission(0x51);
+  Wire.write(0x0F);   // ALRM_WEEK_REG
+  Wire.write(0x80);   // AEN_W=1 → weekday alarm disabled
+  Wire.endTransmission();
+
+  // 3. Enable alarm interrupt (AIE, CTRL2 bit 7) — drives INT LOW on match
+  rtc.enableAlarm();
+
+  // 4. Clear alarm flag (AF, CTRL2 bit 6) LAST — guarantees INT is HIGH at
+  //    sleep entry so EXT1 doesn't fire immediately
+  rtc.resetAlarm();
+  delay(5);  // settle
+
+  Serial.printf("PCF85063 alarm sec=%02d (now %02d:%02d:%02d +%us)\n",
+                tSec, now.getHour(), now.getMinute(), now.getSecond(), seconds);
+}
+
+// All deep-sleep wake sources: RTC alarm (refresh), PWR btn (shutdown), BOOT btn (QR).
+// All three lines are active-LOW and must idle HIGH during deep sleep, otherwise
+// ESP_EXT1_WAKEUP_ANY_LOW sees a floating/LOW pin and wakes immediately (a tight
+// ~15s wake loop). The RTC INT (IO5) is open-drain — when the alarm flag is clear
+// the chip releases it high-Z, so it NEEDS an internal pull held through sleep.
+// pinMode(INPUT_PULLUP) does not survive deep sleep; rtc_gpio_pullup_en does.
+void goAwakeOnAllSources() {
+  // All three wakeup pins are active-LOW and need internal pulls held through
+  // deep sleep. pinMode(INPUT_PULLUP) does NOT survive deep sleep.
+  const gpio_num_t wakePins[] = {
+    (gpio_num_t)RTC_INT_PIN, (gpio_num_t)PWR_BTN_PIN, (gpio_num_t)BOOT_BTN_PIN
+  };
+  for (gpio_num_t p : wakePins) {
+    rtc_gpio_pullup_en(p);
+    rtc_gpio_pulldown_dis(p);
   }
+
+  // Hold PWR_LATCH (IO17) HIGH through deep sleep — board stays powered on battery.
+  digitalWrite(PWR_LATCH, HIGH);
+  gpio_hold_en((gpio_num_t)PWR_LATCH);
+  gpio_deep_sleep_hold_en();
+
+  // RTC alarm pulls IO5 LOW → wakes via EXT1. Buttons also wake via EXT1.
+  esp_sleep_enable_ext1_wakeup(
+    (1ULL << RTC_INT_PIN) | (1ULL << PWR_BTN_PIN) | (1ULL << BOOT_BTN_PIN),
+    ESP_EXT1_WAKEUP_ANY_LOW);
 }
 
 String currentTimeStr() {
@@ -268,9 +347,35 @@ void drawStatusBar(int battPct) {
   display.drawFastHLine(0, STATUS_H, SCREEN_W, GxEPD_BLACK);
 }
 
+// ─── Private QR (secrets.h payload, never push) ───────────────────────────────
+void drawPrivateQR() {
+  QRCode qr;
+  uint8_t qrData[qrcode_getBufferSize(3)];
+  qrcode_initText(&qr, qrData, 3, ECC_LOW, PRIVATE_QR_DATA);
+
+  int scale = constrain(170 / qr.size, 1, 6);
+  int qrPx  = qr.size * scale;
+  int ox    = (SCREEN_W - qrPx) / 2;
+  int oy    = (SCREEN_H - qrPx) / 2;
+
+  DISP_TAKE();
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    for (uint8_t r = 0; r < qr.size; r++)
+      for (uint8_t c = 0; c < qr.size; c++)
+        if (qrcode_getModule(&qr, c, r))
+          display.fillRect(ox + c * scale, oy + r * scale, scale, scale, GxEPD_BLACK);
+  } while (display.nextPage());
+  DISP_GIVE();
+}
+
+
 // ─── Splash ───────────────────────────────────────────────────────────────────
 void drawSplash() {
   int stride = (LOGO_W + 7) / 8;
+  DISP_TAKE();
   display.setFullWindow();
   display.firstPage();
   do {
@@ -282,9 +387,11 @@ void drawSplash() {
       }
     }
   } while (display.nextPage());
+  DISP_GIVE();
 }
 
 void drawShutdown() {
+  DISP_TAKE();
   display.setFullWindow();
   display.firstPage();
   do {
@@ -295,6 +402,7 @@ void drawShutdown() {
   display.setFullWindow();
   display.firstPage();
   do { display.fillScreen(GxEPD_WHITE); } while (display.nextPage());
+  DISP_GIVE();
 }
 
 // ─── Match render ─────────────────────────────────────────────────────────────
@@ -326,14 +434,17 @@ void renderMatch(JsonObject match, int battPct) {
   int hScore = hs  ? atoi(hs)  : -1;
   int aScore = as_ ? atoi(as_) : -1;
   int mid    = atoi(match["id"] | "0");
-  if (mid == lastMatchId && (hScore != lastHomeScore || aScore != lastAwayScore)
-      && lastHomeScore >= 0) {
-    scoreBeep();
-  }
+  bool scoreChanged = (mid == lastMatchId)
+                      && (hScore != lastHomeScore || aScore != lastAwayScore)
+                      && (lastHomeScore >= 0);
+
+  if (scoreChanged) scoreBeep();
+
   lastMatchId   = mid;
   lastHomeScore = hScore;
   lastAwayScore = aScore;
 
+  DISP_TAKE();
   display.setFullWindow();
   display.firstPage();
   do {
@@ -377,16 +488,19 @@ void renderMatch(JsonObject match, int battPct) {
     centreText(footer.c_str(),      182, &FreeSans9pt7b);
 
   } while (display.nextPage());
+  DISP_GIVE();
 }
 
 // ─── Error screen ─────────────────────────────────────────────────────────────
 void showError(const char* msg) {
+  DISP_TAKE();
   display.setFullWindow();
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
     centreText(msg, SCREEN_H / 2, &FreeSans9pt7b);
   } while (display.nextPage());
+  DISP_GIVE();
 }
 
 // ─── QR code for captive portal ───────────────────────────────────────────────
@@ -405,6 +519,7 @@ void drawPortalQR() {
   int ox    = (SCREEN_W - qrPx) / 2;
   int oy    = 22;
 
+  DISP_TAKE();
   display.setFullWindow();
   display.firstPage();
   do {
@@ -434,6 +549,7 @@ void drawPortalQR() {
     display.setCursor((SCREEN_W - tw) / 2, SCREEN_H - 3);
     display.print(PORTAL_URL);
   } while (display.nextPage());
+  DISP_GIVE();
 }
 
 // ─── Captive portal (AP mode WiFi setup) ─────────────────────────────────────
@@ -556,32 +672,102 @@ void pwrButtonTask(void*) {
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
+  // Release the deep-sleep latch on IO17 first, then re-assert it as a normal
+  // output. While held, digitalWrite() has no effect, so this order matters: we
+  // must clear the hold before we can drive the latch (and later the shutdown
+  // path needs to be able to pull it LOW).
+  gpio_hold_dis((gpio_num_t)PWR_LATCH);
+  gpio_deep_sleep_hold_dis();
+  pinMode(PWR_LATCH,   OUTPUT); digitalWrite(PWR_LATCH, HIGH);  // hold power first
+
   Serial.begin(115200);
-
-  pinMode(PWR_LATCH,   OUTPUT); digitalWrite(PWR_LATCH, HIGH);
-  pinMode(LED_PIN,     OUTPUT); ledOn();
+  pinMode(LED_PIN,     OUTPUT);
   pinMode(PWR_BTN_PIN, INPUT_PULLUP);
-  pinMode(BUZZER_PIN,  OUTPUT); digitalWrite(BUZZER_PIN, LOW);
-  pinMode(EPD_PWR,     OUTPUT); digitalWrite(EPD_PWR, LOW);
-  delay(20);
+  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
 
-  SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
-  display.init(115200, true, 2, false);
-  display.setRotation(0);
+  // ── Decide what triggered the wakeup BEFORE touching the display/RTC ──────────
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  bool coldBoot = (cause == ESP_SLEEP_WAKEUP_UNDEFINED);
+  uint64_t wakePin = (cause == ESP_SLEEP_WAKEUP_EXT1)
+                       ? esp_sleep_get_ext1_wakeup_status() : 0;
 
-  // If woken by power button (not timer), show shutdown screen and power off
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
-    // Wait for long-press confirmation (>1s still held)
-    delay(1000);
-    if (digitalRead(PWR_BTN_PIN) == LOW) {
-      for (int i = 0; i < 3; i++) { ledOff(); delay(200); ledOn(); delay(200); }
-      ledOff();
-      drawShutdown();
-      digitalWrite(PWR_LATCH, LOW);
-      delay(500);
+  bool rtcWoke  = (wakePin & (1ULL << RTC_INT_PIN)) != 0;
+  bool pwrWoke  = (wakePin & (1ULL << PWR_BTN_PIN)) != 0;
+  bool bootWoke = (wakePin & (1ULL << BOOT_BTN_PIN)) != 0;
+
+  // PWR button: decide long vs short press before expensive init.
+  // Only act if PWR_BTN is the waker and RTC_INT is NOT — on an RTC alarm wake
+  // the EXT1 status can show IO18 as LOW due to pin bounce.
+  if (pwrWoke && !rtcWoke) {
+    unsigned long t0 = millis();
+    while (digitalRead(PWR_BTN_PIN) == LOW && millis() - t0 < 2000) delay(10);
+    bool longPress = (millis() - t0 >= 2000);
+
+    if (!longPress) {
+      // Short tap → back to sleep, re-arm alarm
+      setWakeupTimer(60);
+      goAwakeOnAllSources();
       esp_deep_sleep_start();
     }
-    // Short press — fall through to normal refresh
+    // Long press → fall through to bring up display and run shutdown screen
+  }
+
+  ledOn();
+  pinMode(EPD_PWR,     OUTPUT); digitalWrite(EPD_PWR, LOW);
+  delay(100);
+
+  dispMutex = xSemaphoreCreateMutex();
+  SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
+  display.init(115200, coldBoot, 2, false);
+  display.setRotation(0);
+
+  // Init PCF85063 — clears the alarm flag (releases INT pin) on every wakeup
+  if (!initRTC()) showError("RTC fail");
+
+  // Long-press shutdown
+  if (pwrWoke && !rtcWoke) {
+    for (int i = 0; i < 3; i++) { ledOff(); delay(200); ledOn(); delay(200); }
+    ledOff();
+    drawShutdown();
+    digitalWrite(PWR_LATCH, LOW);
+    delay(500);
+    esp_deep_sleep_start();
+  }
+
+  // Boot button → show private QR; wait for another press or 15s, then sleep
+  if (bootWoke && !rtcWoke) {
+    while (digitalRead(BOOT_BTN_PIN) == LOW) delay(10);
+    delay(200);
+    drawPrivateQR();
+    unsigned long deadline = millis() + 15000;
+    while (millis() < deadline) {
+      if (digitalRead(BOOT_BTN_PIN) == LOW) {
+        while (digitalRead(BOOT_BTN_PIN) == LOW) delay(10);
+        break;
+      }
+      delay(50);
+    }
+    DISP_TAKE();
+    display.hibernate();
+    digitalWrite(EPD_PWR, HIGH);
+    DISP_GIVE();
+    setWakeupTimer(60);
+    goAwakeOnAllSources();
+    esp_deep_sleep_start();
+  }
+
+  // ── Wake throttling ──────────────────────────────────────────────────────────
+  // RTC alarm wakes every 60s. During a live match refresh every wake. When idle,
+  // only refresh every 5th wake (~5min) to save battery.
+  if (rtcWoke && !coldBoot) {
+    wakeCounter++;
+    bool refreshDue = lastWasLive || (wakeCounter % 5 == 0);
+    if (!refreshDue) {
+      Serial.printf("Idle skip wake %u/5\n", wakeCounter % 5);
+      setWakeupTimer(60);
+      goAwakeOnAllSources();
+      esp_deep_sleep_start();
+    }
   }
 
   xTaskCreate(pwrButtonTask, "pwr", 2048, nullptr, 1, nullptr);
@@ -591,12 +777,10 @@ void setup() {
     delay(2000);
     firstBoot = false;
   }
-  ledOff();  // LED only needed during boot splash
+  ledOff();
 
   int battPct = batteryPercent();
   Serial.printf("Battery: %d%%\n", battPct);
-
-  uint64_t sleepUs = REFRESH_IDLE_US;  // default; shortened to LIVE if match is live
 
   if (!connectWiFi()) {
     Serial.println("WiFi failed — starting captive portal");
@@ -604,12 +788,12 @@ void setup() {
     return;
   }
   Serial.println("WiFi: " + WiFi.localIP().toString());
-  maybeNTP();
+  syncNTP();
 
-  {
+  do {
     Serial.printf("Heap: %u\n", ESP.getFreeHeap());
     JsonDocument gDoc;
-    if (!httpGetJson(API_GAMES_URL, gDoc)) { showError("API error"); goto sleep; }
+    if (!httpGetJson(API_GAMES_URL, gDoc)) { showError("API error"); break; }
 
     JsonArray games = gDoc["games"].as<JsonArray>();
     JsonObject latest;
@@ -626,37 +810,38 @@ void setup() {
       else if (!isLive && finished && gid > latestId) { latestId = gid; latest = g; }
     }
 
-    if (latestId < 0) { showError("No matches yet"); goto sleep; }
+    if (latestId < 0) { showError("No matches yet"); break; }
 
-    if (isLive) sleepUs = REFRESH_LIVE_US;   // fast refresh during live match
+    lastWasLive = isLive;   // drives wake-throttle cadence next cycle
+    if (isLive) wakeCounter = 0;   // reset so idle counting starts fresh after a match
 
-    Serial.printf("%s id=%d  %s %s-%s %s  next=%llus\n",
+    Serial.printf("%s id=%d  %s %s-%s %s\n",
       isLive ? "LIVE" : "FT", latestId,
       (const char*)latest["home_team_name_en"],
       latest["home_score"] | "?", latest["away_score"] | "?",
-      (const char*)latest["away_team_name_en"],
-      sleepUs / 1000000ULL);
+      (const char*)latest["away_team_name_en"]);
 
     renderMatch(latest, battPct);
-  }
-
-sleep:
-  // Record current epoch so clock can be advanced after wakeup
-  { time_t now; time(&now); sleepStartEpoch = (uint32_t)now + (uint32_t)(sleepUs / 1000000ULL); }
+  } while (false);
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
-  // Power down EPD — holds image with zero power
-  display.hibernate();
-  digitalWrite(EPD_PWR, HIGH);   // active-LOW: HIGH = display off
+  // Always re-arm the once-per-minute RTC alarm. Cadence (60s live / 5min idle)
+  // is enforced by the wake-throttle skip logic above, not by the alarm period.
+  setWakeupTimer(60);
 
-  Serial.printf("Deep sleep %llus\n", sleepUs / 1000000ULL);
+  // Power down EPD — holds image with zero power
+  DISP_TAKE();
+  display.hibernate();
+  digitalWrite(EPD_PWR, HIGH);
+  DISP_GIVE();
+
+  Serial.printf("Deep sleep — RTC alarm every 60s (live=%d, wake=%u)\n",
+                lastWasLive, wakeCounter);
   Serial.flush();
 
-  esp_sleep_enable_timer_wakeup(sleepUs);
-  // PWR button (IO18, active LOW) wakes from sleep → handled at next boot
-  esp_sleep_enable_ext1_wakeup(1ULL << PWR_BTN_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
+  goAwakeOnAllSources();
   esp_deep_sleep_start();
 }
 

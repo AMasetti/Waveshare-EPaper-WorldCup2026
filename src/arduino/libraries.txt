@@ -2,3 +2,4 @@
 # One entry per line: "LibraryName" or "LibraryName@version"
 GxEPD2
 ArduinoJson
+SensorLib
